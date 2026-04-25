@@ -7,6 +7,48 @@ base_output_dir='/Volumes/Data/Videos/Lacrosse'
 lut='CinemaGamut_CanonLog3-to-Canon709_33_Ver.1.0.cube'
 target_fps=60
 
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") --opponent <name> [OPTIONS]
+
+Convert Canon Log3 footage from a camera card to H.264 MP4 with LUT applied.
+Clips are named automatically using the opponent name, recording date, and clip
+number. High-speed 1080p clips (assumed 120 fps) are also exported at the
+target frame rate as a slow-motion version.
+
+REQUIRED:
+  --opponent <name>       Name of the opposing team (used in output filenames
+                          and directory, e.g. "TeamName")
+
+OPTIONS:
+  --input-dir  <path>     Directory containing source .mp4/.mov files
+                          (default: /Volumes/EOS_DIGITAL/DCIM/100EOSR7)
+  --output-dir <path>     Base directory for output; a sub-folder named
+                          <opponent>-<date> is created automatically
+                          (default: /Volumes/Data/Videos/Lacrosse)
+  --lut        <file>     Path to a .cube LUT file applied via lut3d filter
+                          (default: CinemaGamut_CanonLog3-to-Canon709_33_Ver.1.0.cube)
+  --target-fps <fps>      Frame rate for the slow-motion export pass; only
+                          runs when the source fps exceeds this value
+                          (default: 60)
+  --help                  Show this help message and exit
+
+OUTPUT NAMING:
+  Pass 1 (primary):   <opponent>_<YYYY-MM-DD>_<NNN>_<src_fps>fps.mp4
+  Pass 2 (slow-mo):   <opponent>_<YYYY-MM-DD>_<NNN>_<target_fps>fps.mp4
+    (Pass 2 only runs when source fps > --target-fps)
+
+EXAMPLES:
+  $(basename "$0") --opponent Loyola
+  $(basename "$0") --opponent Loyola --target-fps 30
+  $(basename "$0") --opponent Loyola --input-dir ~/Desktop/footage --output-dir ~/Movies
+  $(basename "$0") --opponent Loyola --lut ~/luts/custom.cube --target-fps 30
+
+DEPENDENCIES:
+  ffmpeg / ffprobe   https://ffmpeg.org
+EOF
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --opponent)   opponent="$2";        shift 2 ;;
@@ -14,13 +56,15 @@ while [[ $# -gt 0 ]]; do
         --output-dir) base_output_dir="$2"; shift 2 ;;
         --lut)        lut="$2";             shift 2 ;;
         --target-fps) target_fps="$2";      shift 2 ;;
+        --help)       usage; exit 0 ;;
         *) echo "Unknown argument: $1"; exit 1 ;;
     esac
 done
 
 if [ -z "$opponent" ]; then
     echo "Error: --opponent is required."
-    echo "Usage: $0 --opponent <name> [--input-dir <path>] [--output-dir <path>] [--lut <file>] [--target-fps <fps>]"
+    echo
+    usage
     exit 1
 fi
 
@@ -99,7 +143,7 @@ for video_path in "${files[@]}"; do
         filter_chain="lut3d=$lut:interp=trilinear"
         [ -n "$unsharp" ] && filter_chain="$filter_chain,$unsharp"
         
-        ffmpeg -v error -i "$video_path" \
+        nice -n 10 ffmpeg -v error -i "$video_path" \
             -vf "$filter_chain" \
             -c:v h264_videotoolbox \
             -b:v 20M \
@@ -118,7 +162,7 @@ for video_path in "${files[@]}"; do
             drop_frames=$(echo "120 / $target_fps" | bc)
             slow_filter="select='not(mod(n,$drop_frames))',setpts=N/$target_fps/TB,$filter_chain"
             
-            ffmpeg -v error -i "$video_path" \
+            nice -n 10 ffmpeg -v error -i "$video_path" \
                 -vf "$slow_filter" \
                 -r "$target_fps" \
                 -c:v h264_videotoolbox \
