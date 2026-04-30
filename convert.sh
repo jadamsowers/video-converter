@@ -77,6 +77,59 @@ get_meta() {
     ffprobe -v error -select_streams v:0 -show_entries "$2" -of default=noprint_wrappers=1:nokey=1 "$1" | head -n 1
 }
 
+# Helper to analyze footage and calculate exposure adjustment (in stops)
+get_exposure_adj() {
+    local file="$1"
+    local dur=$(get_meta "$file" "format=duration")
+    
+    # If duration is missing or very short, skip analysis
+    if [[ -z "$dur" ]] || (( $(echo "$dur < 1" | bc -l) )); then
+        echo "0"
+        return
+    fi
+
+    # Sample at 25%, 50%, and 75% for a better average
+    local p25=$(echo "$dur * 0.25" | bc)
+    local p50=$(echo "$dur * 0.50" | bc)
+    local p75=$(echo "$dur * 0.75" | bc)
+    
+    local sum=0
+    local count=0
+    for p in $p25 $p50 $p75; do
+        # Extract average luminance (YAVG) using signalstats
+        local val=$(ffmpeg -ss "$p" -i "$file" -frames:v 1 -vf signalstats,metadata=print -f null - 2>&1 | grep "lavfi.signalstats.YAVG" | cut -d= -f2 | head -n 1)
+        if [[ -n "$val" ]]; then
+            sum=$(echo "$sum + $val" | bc)
+            ((count++))
+        fi
+    done
+    
+    if [ "$count" -eq 0 ]; then
+        echo "0"
+        return
+    fi
+    
+    local avg_yavg=$(echo "scale=2; $sum / $count" | bc)
+    
+    # Target middle grey for C-Log3 is roughly 90-100 in 8-bit scale
+    local target=100
+    
+    # Calculate exposure adjustment: log2(target / avg_yavg)
+    local adj=$(echo "scale=2; l($target / $avg_yavg) / l(2)" | bc -l)
+    
+    # Clamp to reasonable range to avoid extreme distortion
+    if (( $(echo "$adj > 2.0" | bc -l) )); then adj="2.0"; fi
+    if (( $(echo "$adj < -2.0" | bc -l) )); then adj="-2.0"; fi
+    
+    # Return 0 if adjustment is negligible (e.g., < 0.1 stops)
+    if (( $(echo "$adj > -0.1" | bc -l) )) && (( $(echo "$adj < 0.1" | bc -l) )); then
+        echo "0"
+        return
+    fi
+
+    echo "$adj"
+}
+
 shopt -s nullglob
 files=("$input_dir"/*.{mp4,MP4,mov,MOV})
 total_files=${#files[@]}
@@ -104,6 +157,13 @@ MAX_JOBS=8  # Processing 8 streams at once given your dual hardware encoders
 echo "Found $total_files videos. Opponent: $opponent. Output: $output_dir"
 
 for video_path in "${files[@]}"; do
+    
+    # Skip short clips (less than 5 seconds)
+    duration=$(get_meta "$video_path" "format=duration")
+    if [[ -z "$duration" ]] || (( $(echo "$duration < 5" | bc -l) )); then
+        echo "Skipping $(basename "$video_path") (too short or unreadable: ${duration:-0}s)"
+        continue
+    fi
     
     # Extract metadata synchronously to ensure correct clip numbering and naming
     creation_time=$(get_meta "$video_path" "stream_tags=creation_time")
@@ -140,7 +200,17 @@ for video_path in "${files[@]}"; do
         primary_name="${base_name}_${input_fps_int}fps.mp4"
         echo "Processing Pass 1 (Primary): $primary_name (${height}p)"
         
-        filter_chain="lut3d=$lut:interp=trilinear"
+        # Analyze exposure
+        echo "Analyzing exposure for $primary_name..."
+        exposure_adj=$(get_exposure_adj "$video_path")
+        
+        if [ "$exposure_adj" != "0" ]; then
+            echo "  Applying exposure adjustment: $exposure_adj stops"
+            filter_chain="exposure=$exposure_adj,lut3d=$lut:interp=trilinear"
+        else
+            filter_chain="lut3d=$lut:interp=trilinear"
+        fi
+        
         [ -n "$unsharp" ] && filter_chain="$filter_chain,$unsharp"
         
         nice -n 10 ffmpeg -v error -i "$video_path" \
