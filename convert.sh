@@ -9,6 +9,7 @@ target_fps=60
 MAX_JOBS=4  # Processing 8 streams at once given your dual hardware encoders
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
 THUMB_SCRIPT="$SCRIPT_DIR/../video-sharing/generate_thumbnails.py"
+MANIFEST_SCRIPT="$SCRIPT_DIR/../video-sharing/generate_manifest.py"
 
 usage() {
     cat <<EOF
@@ -260,7 +261,7 @@ for video_path in "${files[@]}"; do
         # Generate scrubber thumbnails for primary
         if [ -f "$THUMB_SCRIPT" ]; then
             echo "  Generating scrubber thumbnails for $primary_name..."
-            python3 "$THUMB_SCRIPT" "$output_dir/$primary_name"
+            python3 "$THUMB_SCRIPT" "$output_dir/$primary_name" || echo "  Warning: scrubber thumbnail generation failed for $primary_name"
         fi
             
         # PASS 2: Special case for frame rate reduction (e.g. 120 -> 60)
@@ -286,7 +287,7 @@ for video_path in "${files[@]}"; do
             # Generate scrubber thumbnails for slow-mo
             if [ -f "$THUMB_SCRIPT" ]; then
                 echo "  Generating scrubber thumbnails for $slow_name..."
-                python3 "$THUMB_SCRIPT" "$output_dir/$slow_name"
+                python3 "$THUMB_SCRIPT" "$output_dir/$slow_name" || echo "  Warning: scrubber thumbnail generation failed for $slow_name"
             fi
         fi
         
@@ -301,3 +302,11 @@ done
 
 wait
 echo "Conversion complete. All $total_files videos processed."
+
+# Generate manifest.json for the output game folder (and update folders.json in the sport dir)
+if [ -f "$MANIFEST_SCRIPT" ]; then
+    echo "Generating manifest for $output_dir..."
+    python3 "$MANIFEST_SCRIPT" --folder "$output_dir" || echo "Warning: manifest generation failed for $output_dir"
+else
+    echo "Warning: manifest script not found at $MANIFEST_SCRIPT — skipping manifest generation."
+fi
