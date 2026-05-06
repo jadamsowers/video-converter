@@ -1,0 +1,22 @@
+# Output files
+*.mp4
+*.jpg
+*.vtt
+
+# Generated JSON manifests
+manifest.json
+folder.json
+sports.json
+
+# Output directory
+output/
+
+# Scratch / throwaway scripts
+scratch/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
