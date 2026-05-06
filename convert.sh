@@ -6,6 +6,9 @@ input_dir='/Volumes/EOS_DIGITAL/DCIM/100EOSR7'
 base_output_dir='/Volumes/Data/Videos/Lacrosse'
 lut='CinemaGamut_CanonLog3-to-Canon709_33_Ver.1.0.cube'
 target_fps=60
+MAX_JOBS=4  # Processing 8 streams at once given your dual hardware encoders
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+THUMB_SCRIPT="$SCRIPT_DIR/../video-sharing/generate_thumbnails.py"
 
 usage() {
     cat <<EOF
@@ -68,6 +71,15 @@ if [ -z "$opponent" ]; then
     exit 1
 fi
 
+# Sanitize opponent name for filesystem use (remove spaces/special chars)
+opponent_slug=$(echo "$opponent" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_')
+# If slug is empty (all special chars), fallback to original with underscores
+[ -z "$opponent_slug" ] && opponent_slug=$(echo "$opponent" | tr ' ' '_')
+
+# Resolve absolute paths to prevent issues in background subshells
+[[ "$input_dir" != /* ]] && input_dir="$PWD/$input_dir"
+[[ "$base_output_dir" != /* ]] && base_output_dir="$PWD/$base_output_dir"
+
 # Configuration
 unsharp='' # e.g., 'unsharp=3:3:0.25:3:3:0.1'
 
@@ -111,22 +123,44 @@ get_exposure_adj() {
     
     local avg_yavg=$(echo "scale=2; $sum / $count" | bc)
     
-    # Target middle grey for C-Log3 is roughly 90-100 in 8-bit scale
-    local target=100
+    # Detect bit depth to normalize YAVG (signalstats returns native depth values)
+    local bits=$(get_meta "$file" "stream=bits_per_raw_sample")
+    # If bits is not a number or <= 8, fall back to pix_fmt check
+    if [[ ! "$bits" =~ ^[0-9]+$ ]] || [ "$bits" -le 8 ]; then
+        local pix_fmt=$(get_meta "$file" "stream=pix_fmt")
+        if [[ "$pix_fmt" == *10* ]]; then bits=10; 
+        elif [[ "$pix_fmt" == *12* ]]; then bits=12; 
+        else bits=8; fi
+    fi
     
-    # Calculate exposure adjustment: log2(target / avg_yavg)
-    local adj=$(echo "scale=2; l($target / $avg_yavg) / l(2)" | bc -l)
+    # Normalize avg_yavg to an 8-bit scale (0-255)
+    local divisor=$(echo "2^($bits - 8)" | bc)
+    local norm_avg=$(echo "scale=2; $avg_yavg / $divisor" | bc)
+    
+    # Target middle grey (normalized to 8-bit). 
+    # 105 is a good target for punchy sports footage.
+    local target=105
+    
+    # Avoid division by zero or log of zero
+    if (( $(echo "$norm_avg <= 0" | bc -l) )); then
+        echo "0"
+        return
+    fi
+    
+    # Calculate exposure adjustment: log2(target / norm_avg)
+    local adj=$(echo "scale=4; l($target / $norm_avg) / l(2)" | bc -l)
     
     # Clamp to reasonable range to avoid extreme distortion
     if (( $(echo "$adj > 2.0" | bc -l) )); then adj="2.0"; fi
     if (( $(echo "$adj < -2.0" | bc -l) )); then adj="-2.0"; fi
     
-    # Return 0 if adjustment is negligible (e.g., < 0.1 stops)
-    if (( $(echo "$adj > -0.1" | bc -l) )) && (( $(echo "$adj < 0.1" | bc -l) )); then
+    # Return 0 if adjustment is negligible (e.g., < 0.15 stops)
+    local abs_adj=$(echo "scale=4; if ($adj < 0) -($adj) else $adj" | bc -l)
+    if (( $(echo "$abs_adj < 0.15" | bc -l) )); then
         echo "0"
         return
     fi
-
+    
     echo "$adj"
 }
 
@@ -148,13 +182,10 @@ fi
 # Date with NO dashes for the filename (YYYYMMDD)
 today_clean=$(echo "$video_date_dir" | tr -d '-')
 
-output_dir="$base_output_dir/$opponent-$video_date_dir"
+output_dir="$base_output_dir/$opponent_slug-$video_date_dir"
 mkdir -p "$output_dir"
 
-# Speed optimization: M1 Max parallel processing
-MAX_JOBS=8  # Processing 8 streams at once given your dual hardware encoders
-
-echo "Found $total_files videos. Opponent: $opponent. Output: $output_dir"
+echo "Found $total_files videos. Opponent: $opponent (using $opponent_slug for paths). Output: $output_dir"
 
 for video_path in "${files[@]}"; do
     
@@ -194,7 +225,7 @@ for video_path in "${files[@]}"; do
 
     # Background the conversion process
     (
-        base_name="${opponent}_${video_date}_${clip_num}"
+        base_name="${opponent_slug}_${video_date}_${clip_num}"
         
         # PASS 1: Always convert (Primary version)
         primary_name="${base_name}_${input_fps_int}fps.mp4"
@@ -202,12 +233,13 @@ for video_path in "${files[@]}"; do
         
         # Analyze exposure
         echo "Analyzing exposure for $primary_name..."
-        exposure_adj=$(get_exposure_adj "$video_path")
+        exposure_result=$(get_exposure_adj "$video_path")
         
-        if [ "$exposure_adj" != "0" ]; then
-            echo "  Applying exposure adjustment: $exposure_adj stops"
-            filter_chain="exposure=$exposure_adj,lut3d=$lut:interp=trilinear"
+        if [ "$exposure_result" != "0" ]; then
+            echo "  Applying exposure adjustment: $exposure_result stops"
+            filter_chain="exposure=$exposure_result,lut3d=$lut:interp=trilinear"
         else
+            echo "  No exposure adjustment needed (or negligible)"
             filter_chain="lut3d=$lut:interp=trilinear"
         fi
         
@@ -220,6 +252,16 @@ for video_path in "${files[@]}"; do
             -an \
             -movflags +faststart \
             -y "$output_dir/$primary_name"
+            
+        # Generate card thumbnail (once per clip)
+        echo "  Generating card thumbnail for $base_name..."
+        ffmpeg -v error -i "$output_dir/$primary_name" -ss 00:00:01 -vframes 1 -vf "scale=480:-1" -y "$output_dir/${base_name}_thumb.jpg"
+
+        # Generate scrubber thumbnails for primary
+        if [ -f "$THUMB_SCRIPT" ]; then
+            echo "  Generating scrubber thumbnails for $primary_name..."
+            python3 "$THUMB_SCRIPT" "$output_dir/$primary_name"
+        fi
             
         # PASS 2: Special case for frame rate reduction (e.g. 120 -> 60)
         # Never add frames: only run if input_fps > target_fps
@@ -240,6 +282,12 @@ for video_path in "${files[@]}"; do
                 -an \
                 -movflags +faststart \
                 -y "$output_dir/$slow_name"
+                
+            # Generate scrubber thumbnails for slow-mo
+            if [ -f "$THUMB_SCRIPT" ]; then
+                echo "  Generating scrubber thumbnails for $slow_name..."
+                python3 "$THUMB_SCRIPT" "$output_dir/$slow_name"
+            fi
         fi
         
         echo "Finished clip $clip_num"
