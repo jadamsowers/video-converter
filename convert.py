@@ -17,6 +17,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Defaults
@@ -32,10 +33,28 @@ SPRITE_INTERVAL = 2    # seconds between thumbnail frames
 SPRITE_WIDTH    = 160  # px wide per tile
 SPRITE_COLUMNS  = 10   # columns in the sprite grid
 
-# Exposure analysis
-EXPOSURE_TARGET     = 105   # 8-bit middle-grey target for sports footage
-EXPOSURE_MIN_ADJ    = 0.15  # stops — ignore adjustments smaller than this
-EXPOSURE_MAX_ADJ    = 2.0   # stops — clamp to this range
+# Exposure analysis — all measurements are on the raw Canon Log3 source (pre-LUT).
+#
+# Canon Log3 10-bit signal levels (legal range 64–940 out of 1023):
+#   Middle grey  ≈ 363  (35.5 % of 1023)
+#   18 % grey    ≈ 351
+#   White clip   ≈ 940
+#
+# signalstats YAVG is reported in the native pixel range of the decoded frame:
+# 0–1023 for 10-bit, 0–255 for 8-bit.  The target is scaled to match.
+#
+# Target: YAVG ≈ 363 (Log3 middle grey in 10-bit).  We only nudge clips that
+# are meaningfully off — EXPOSURE_MIN_ADJ stops is the dead-band.
+#
+# The gain is applied via a ``lut`` filter that multiplies each Y (luma) value
+# by the gain factor BEFORE the 3D LUT.  This operates directly on encoded
+# pixel values with no colour-space conversion — the correct approach for
+# log-encoded footage.  The ffmpeg ``exposure`` filter must NOT be used here
+# because it linearises the signal first, which produces incorrect results on
+# log-encoded footage and conflicts with the LUT's expected input range.
+LOG3_MIDGREY_10BIT  = 363   # Canon Log3 middle grey in 10-bit (≈ 35.5 % of 1023)
+EXPOSURE_MIN_ADJ    = 0.20  # stops — ignore adjustments smaller than this
+EXPOSURE_MAX_ADJ    = 1.5   # stops — clamp to this range (conservative for safety)
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +116,7 @@ def get_meta_value(file_path: str, show_entries: str) -> str:
         return ""
 
 
-def get_video_info(file_path: str) -> dict | None:
+def get_video_info(file_path: str) -> Optional[dict]:
     """Return duration, fps, width, height for the first video stream, or None."""
     cmd = [
         "ffprobe", "-v", "error",
@@ -147,15 +166,45 @@ def get_creation_date(file_path: str) -> str:
 # ---------------------------------------------------------------------------
 # Helpers — exposure analysis
 # ---------------------------------------------------------------------------
-def get_exposure_adjustment(file_path: str, duration: float) -> float:
+def get_exposure_gain_filter(file_path: str, duration: float) -> tuple[str, float]:
     """
-    Sample the clip at 25 %, 50 %, and 75 % of its duration, measure average
-    luminance (YAVG via signalstats), normalise to 8-bit, and return the number
-    of stops needed to reach EXPOSURE_TARGET.  Returns 0.0 if the adjustment is
-    negligible or cannot be determined.
+    Sample the clip at 25 %, 50 %, and 75 % of its duration, measuring YAVG
+    directly from the **raw Canon Log3 source** (pre-LUT).
+
+    YAVG is compared against LOG3_MIDGREY_10BIT (363 in 10-bit).  The ratio
+    gives the linear gain needed to bring the average exposure to middle grey.
+
+    The gain is applied via a ``lut`` filter that multiplies each Y (luma)
+    value by the gain factor and clamps to the legal range.  This operates
+    directly on the encoded pixel values with no colour-space conversion —
+    the correct approach for log-encoded footage.  The ``exposure`` ffmpeg
+    filter must NOT be used here because it linearises the signal first.
+
+    Returns ``(ffmpeg_filter_str, stops)`` where ffmpeg_filter_str is ready
+    to prepend to the filter chain, or ``('', 0.0)`` if no adjustment needed.
     """
     if duration < 1:
-        return 0.0
+        return "", 0.0
+
+    # Detect source bit depth once
+    bits_str = get_meta_value(file_path, "stream=bits_per_raw_sample")
+    try:
+        bits = int(bits_str)
+        if bits <= 8:
+            raise ValueError
+    except (ValueError, TypeError):
+        pix_fmt = get_meta_value(file_path, "stream=pix_fmt")
+        if "10" in pix_fmt:
+            bits = 10
+        elif "12" in pix_fmt:
+            bits = 12
+        else:
+            bits = 8
+
+    maxval = (2 ** bits) - 1          # 1023 for 10-bit, 255 for 8-bit
+    # signalstats reports in native bit depth, so no normalisation needed
+    # when comparing against a target scaled to the same bit depth.
+    target = LOG3_MIDGREY_10BIT * (maxval / 1023)   # scale target to native bits
 
     samples = [duration * pct for pct in (0.25, 0.50, 0.75)]
     yavg_values = []
@@ -173,46 +222,40 @@ def get_exposure_adjustment(file_path: str, duration: float) -> float:
             combined = out.stdout + out.stderr
             for line in combined.splitlines():
                 if "lavfi.signalstats.YAVG" in line:
-                    val_str = line.split("=")[-1].strip()
-                    yavg_values.append(float(val_str))
+                    try:
+                        yavg_values.append(float(line.split("=")[-1].strip()))
+                    except ValueError:
+                        pass
                     break
         except Exception:
             continue
 
     if not yavg_values:
-        return 0.0
+        return "", 0.0
 
     avg_yavg = sum(yavg_values) / len(yavg_values)
 
-    # Detect bit depth
-    bits_str = get_meta_value(file_path, "stream=bits_per_raw_sample")
-    try:
-        bits = int(bits_str)
-        if bits <= 8:
-            raise ValueError
-    except (ValueError, TypeError):
-        pix_fmt = get_meta_value(file_path, "stream=pix_fmt")
-        if "10" in pix_fmt:
-            bits = 10
-        elif "12" in pix_fmt:
-            bits = 12
-        else:
-            bits = 8
+    if avg_yavg <= 0:
+        return "", 0.0
 
-    # Normalise to 8-bit scale
-    divisor = 2 ** (bits - 8)
-    norm_avg = avg_yavg / divisor
+    # gain: ratio of target to measured average in log-encoded space.
+    # Multiplying encoded values by this constant shifts exposure uniformly.
+    gain = target / avg_yavg
+    stops = math.log2(gain)
+    stops = max(-EXPOSURE_MAX_ADJ, min(EXPOSURE_MAX_ADJ, stops))
 
-    if norm_avg <= 0:
-        return 0.0
+    if abs(stops) < EXPOSURE_MIN_ADJ:
+        return "", 0.0
 
-    adj = math.log2(EXPOSURE_TARGET / norm_avg)
-    adj = max(-EXPOSURE_MAX_ADJ, min(EXPOSURE_MAX_ADJ, adj))
+    # Re-derive gain from clamped stops for consistency
+    gain = round(2 ** stops, 6)
 
-    if abs(adj) < EXPOSURE_MIN_ADJ:
-        return 0.0
-
-    return round(adj, 4)
+    # lut filter: multiply Y by gain, clamp to [0, maxval].
+    # 'val' in lut expressions is the raw pixel value in native bit depth.
+    # Cb/Cr (chroma) are left unchanged — Log3 chroma is nearly neutral so
+    # luma-only scaling is a good approximation of a true exposure change.
+    lut_expr = f"lut=y='clip(val*{gain},0,{maxval})'"
+    return lut_expr, round(stops, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -397,11 +440,13 @@ def convert_clip(
     except (ValueError, TypeError):
         duration = 0.0
 
-    exposure_adj = get_exposure_adjustment(str(video_path), duration)
+    # Measure YAVG on the raw Log3 source and build a lut filter that scales
+    # encoded pixel values by the required gain before the 3D LUT.
+    gain_filter, exposure_stops = get_exposure_gain_filter(str(video_path), duration)
 
-    if exposure_adj != 0.0:
-        print(f"[{clip_num}]   Applying exposure adjustment: {exposure_adj:+.4f} stops")
-        filter_chain = f"exposure={exposure_adj},lut3d={lut}:interp=trilinear"
+    if gain_filter:
+        print(f"[{clip_num}]   Applying exposure adjustment: {exposure_stops:+.4f} stops")
+        filter_chain = f"{gain_filter},lut3d={lut}:interp=trilinear"
     else:
         print(f"[{clip_num}]   No exposure adjustment needed")
         filter_chain = f"lut3d={lut}:interp=trilinear"
